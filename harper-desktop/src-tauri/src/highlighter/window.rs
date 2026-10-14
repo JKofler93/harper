@@ -123,10 +123,15 @@ impl Window {
     }
 
     pub fn render(&mut self, render_state: &mut RenderState) {
+        let Ok(position) = self.inner.inner_position() else {
+            return;
+        };
+        let position = position.to_logical::<f32>(self.inner.scale_factor());
+        let viewport_origin = egui::vec2(position.x, position.y);
         let context = self.egui_state.egui_ctx().clone();
         let input = self.egui_state.take_egui_input(&self.inner);
         let output = context.run_ui(input, |ui| {
-            render_state.render(ui);
+            render_state.render(ui, viewport_origin);
         });
 
         self.egui_state
