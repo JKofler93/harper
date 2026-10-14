@@ -1,15 +1,16 @@
-use accessibility::attribute::AXUIElementAttributes;
+use accessibility::attribute::{AXAttribute, AXUIElementAttributes};
 use accessibility::ui_element::AXUIElement;
 use accessibility::{Error, TreeVisitor, TreeWalker, TreeWalkerFlow};
 use accessibility_sys::{
     AXUIElementCopyParameterizedAttributeValue, AXValueCreate, AXValueGetType, AXValueGetValue,
     AXValueRef, kAXBoundsForRangeParameterizedAttribute, kAXErrorIllegalArgument, kAXErrorNoValue,
-    kAXErrorParameterizedAttributeUnsupported, kAXErrorSuccess, kAXValueTypeCFRange,
-    kAXValueTypeCGRect,
+    kAXErrorParameterizedAttributeUnsupported, kAXErrorSuccess, kAXSelectedTextAttribute,
+    kAXSelectedTextRangeAttribute, kAXValueTypeCFRange, kAXValueTypeCGRect,
 };
 use core::{ffi::c_void, mem::MaybeUninit};
 use core_foundation::base::{CFRange, CFType, TCFType};
 use core_foundation::string::CFString;
+use harper_core::Span;
 use harper_core::linting::{Lint, Suggestion};
 use objc2_foundation::NSRect;
 use std::{
@@ -223,6 +224,54 @@ fn apply_suggestion_to_element(
     lint: Lint,
     suggestion: Suggestion,
 ) {
+    // A popup can outlive its source text. Never overwrite edits made since it was opened.
+    if element
+        .value()
+        .ok()
+        .as_ref()
+        .and_then(cf_type_to_string)
+        .as_deref()
+        != Some(source_text.as_str())
+    {
+        eprintln!("Unable to apply suggestion: source text changed or is unavailable");
+        return;
+    }
+
+    let Some((range, replacement)) = suggestion_edit(&source_text, lint.span, &suggestion) else {
+        eprintln!("Unable to apply suggestion: invalid text range");
+        return;
+    };
+    let selected_range = AXAttribute::new(&CFString::new(kAXSelectedTextRangeAttribute));
+    let selected_text = AXAttribute::new(&CFString::new(kAXSelectedTextAttribute));
+
+    // Rich editors such as Teams do not reliably accept whole-value writes. Their native
+    // selected-text action edits the document and preserves the surrounding formatting.
+    if element.is_settable(&selected_range).unwrap_or(false)
+        && element.is_settable(&selected_text).unwrap_or(false)
+    {
+        let range_value = unsafe {
+            AXValueCreate(
+                kAXValueTypeCFRange,
+                &range as *const CFRange as *const c_void,
+            )
+        };
+        if range_value.is_null() {
+            eprintln!("Unable to apply suggestion: could not create text range");
+            return;
+        }
+        let range_value = unsafe { CFType::wrap_under_create_rule(range_value as _) };
+        if let Err(error) = element
+            .set_attribute(&selected_range, range_value)
+            .and_then(|()| {
+                element.set_attribute(&selected_text, CFString::new(&replacement).as_CFType())
+            })
+        {
+            eprintln!("Unable to apply suggestion using selected text: {error}");
+        }
+        return;
+    }
+
+    // Preserve support for simple controls that only expose a writable AXValue.
     let mut chars = source_text.chars().collect::<Vec<_>>();
     suggestion.apply(lint.span, &mut chars);
     let updated = chars.into_iter().collect::<String>();
@@ -231,6 +280,40 @@ fn apply_suggestion_to_element(
     if let Err(error) = element.set_value(value.as_CFType()) {
         eprintln!("Unable to apply suggestion: {error}");
     }
+}
+
+/// AX ranges use UTF-16 code units, while Harper spans use Unicode scalar values.
+fn suggestion_edit(
+    source: &str,
+    span: Span<char>,
+    suggestion: &Suggestion,
+) -> Option<(CFRange, String)> {
+    let chars: Vec<char> = source.chars().collect();
+    if span.start > span.end || span.end > chars.len() {
+        return None;
+    }
+    let (start, replacement) = match suggestion {
+        Suggestion::ReplaceWith(chars) => (span.start, chars.iter().collect()),
+        Suggestion::InsertAfter(chars) => (span.end, chars.iter().collect()),
+        Suggestion::Remove => (span.start, String::new()),
+    };
+    Some((
+        CFRange {
+            location: chars[..start]
+                .iter()
+                .map(|c| c.len_utf16())
+                .sum::<usize>()
+                .try_into()
+                .ok()?,
+            length: chars[start..span.end]
+                .iter()
+                .map(|c| c.len_utf16())
+                .sum::<usize>()
+                .try_into()
+                .ok()?,
+        },
+        replacement,
+    ))
 }
 
 /// Returns whether an accessibility element has a text role Harper can lint.
@@ -359,6 +442,34 @@ fn element_rect_for_text_range(
 mod tests {
     use super::*;
     use crate::rect::Rect;
+
+    #[test]
+    fn suggestion_edits_use_utf16_and_preserve_suggestion_semantics() {
+        let source = "😀 I could of 🙂 done this.";
+        let span = Span::new(4, 14);
+        for suggestion in [
+            Suggestion::ReplaceWith("could have".chars().collect()),
+            Suggestion::InsertAfter(vec![',']),
+            Suggestion::Remove,
+        ] {
+            let (range, replacement) = suggestion_edit(source, span, &suggestion).unwrap();
+            let mut actual: Vec<u16> = source.encode_utf16().collect();
+            actual.splice(
+                range.location as usize..(range.location + range.length) as usize,
+                replacement.encode_utf16(),
+            );
+            let mut expected: Vec<char> = source.chars().collect();
+            suggestion.apply(span, &mut expected);
+            assert_eq!(
+                String::from_utf16(&actual).unwrap(),
+                expected.iter().collect::<String>()
+            );
+        }
+        assert!(suggestion_edit(source, Span::new(0, 100), &Suggestion::Remove).is_none());
+        let mut reversed_span = span;
+        reversed_span.start = reversed_span.end + 1;
+        assert!(suggestion_edit(source, reversed_span, &Suggestion::Remove).is_none());
+    }
 
     #[test]
     fn supported_text_roles_include_text_area_and_text_field() {
