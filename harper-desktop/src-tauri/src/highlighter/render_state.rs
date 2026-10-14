@@ -60,6 +60,9 @@ pub struct RenderState {
     /// `None` means no popup should be rendered.
     highlighted_lint: Option<usize>,
 
+    /// Actual global bounds, including repositioning to keep the popup on its screen.
+    rendered_popup_rect: Option<egui::Rect>,
+
     /// Cache for markdown-rendered lint messages so popup redraws do not repeatedly rebuild markdown
     /// resources from scratch.
     markdown_cache: CommonMarkCache,
@@ -86,6 +89,7 @@ impl RenderState {
         let mut state = Self {
             last_lints: None,
             highlighted_lint: None,
+            rendered_popup_rect: None,
             markdown_cache: CommonMarkCache::default(),
             ignore_lint,
             add_to_dictionary,
@@ -103,7 +107,7 @@ impl RenderState {
             .highlighted_lint
             .is_some_and(|index| index >= self.lints().len())
         {
-            self.highlighted_lint = None;
+            self.close_popup();
         }
     }
 
@@ -118,11 +122,13 @@ impl RenderState {
     /// disappeared after the latest accessibility read.
     pub fn set_highlighted_lint(&mut self, highlighted_lint: Option<usize>) {
         self.highlighted_lint = highlighted_lint.filter(|index| *index < self.lints().len());
+        self.rendered_popup_rect = None;
     }
 
     /// Centralizes the close behavior so the popup close button only has to clear the selected lint.
     pub fn close_popup(&mut self) {
         self.highlighted_lint = None;
+        self.rendered_popup_rect = None;
     }
 
     /// Checks if a given position touches a hit target.
@@ -139,29 +145,48 @@ impl RenderState {
             .map_or(HitTarget::None, HitTarget::Lint)
     }
 
-    /// Computes popup hit-test bounds from our layout contract instead of waiting for egui to report
-    /// rendered bounds, which keeps hit-testing available before the next render pass completes.
+    /// Uses the visible popup bounds: egui can move the card above its requested position near
+    /// screen edges. The requested bounds are only a fallback before the first render.
     pub fn popup_rect(&self) -> Option<egui::Rect> {
         self.highlighted_lint
             .and_then(|index| self.lints().get(index))
-            .map(|positioned_lint| popup_rect_for_lint(&positioned_lint.rect))
+            .map(|positioned_lint| {
+                self.rendered_popup_rect
+                    .unwrap_or_else(|| popup_rect_for_lint(&positioned_lint.rect))
+            })
     }
 
     /// Draws highlights and the active popup from the same state used by hit-testing so visible
     /// regions and clickable regions do not drift apart.
-    pub fn render(&mut self, ui: &mut egui::Ui) {
+    pub fn render(&mut self, ui: &mut egui::Ui, viewport_origin: egui::Vec2) {
         for positioned_lint in self.lints() {
-            draw_highlight(ui, &positioned_lint.rect, &positioned_lint.lint);
+            draw_highlight(
+                ui,
+                &local_rect(positioned_lint.rect, viewport_origin),
+                &positioned_lint.lint,
+            );
         }
 
         if let Some(index) = self.highlighted_lint
             && let Some(positioned_lint) = self.lints().get(index)
         {
-            let rect = positioned_lint.rect;
+            let rect = local_rect(positioned_lint.rect, viewport_origin);
+            // Only the screen containing the lint owns the popup and its hit-test bounds.
+            let viewport = ui.ctx().viewport_rect();
+            let anchor = rect_bounds(&rect).min;
+            if !(viewport.left()..viewport.right()).contains(&anchor.x)
+                || !(viewport.top()..viewport.bottom()).contains(&anchor.y)
+            {
+                return;
+            }
             let lint = positioned_lint.lint.clone();
             let source_text = positioned_lint.source_text.clone();
 
-            match render_lint_card(ui, &rect, &lint, &source_text, &mut self.markdown_cache) {
+            let (action, popup_rect) =
+                render_lint_card(ui, &rect, &lint, &source_text, &mut self.markdown_cache);
+            self.rendered_popup_rect = Some(popup_rect.translate(viewport_origin));
+
+            match action {
                 Some(LintCardAction::Close) => self.close_popup(),
                 Some(LintCardAction::ApplySuggestion(suggestion)) => {
                     if let Some(actionable_lint) = self
@@ -242,17 +267,17 @@ fn draw_highlight(ui: &mut egui::Ui, rect: &Rect, lint: &Lint) {
     );
 }
 
-/// Renders the suggestion popup and returns whether the explicit close control was clicked.
+/// Returns the popup action and actual bounds after egui constrains it to the screen.
 fn render_lint_card(
     ui: &mut egui::Ui,
     rect: &Rect,
     lint: &Lint,
     source_text: &str,
     markdown_cache: &mut CommonMarkCache,
-) -> Option<LintCardAction> {
+) -> (Option<LintCardAction>, egui::Rect) {
     let popup_rect = popup_rect_for_lint(rect);
 
-    egui::Area::new(egui::Id::new("harper-lint-card"))
+    let response = egui::Area::new(egui::Id::new("harper-lint-card"))
         .order(egui::Order::Foreground)
         .fixed_pos(popup_rect.min)
         .show(ui.ctx(), |ui| {
@@ -282,8 +307,8 @@ fn render_lint_card(
                     render_popover_footer(ui, lint, source_text, &mut action);
                 });
             action
-        })
-        .inner
+        });
+    (response.inner, response.response.rect)
 }
 
 /// Renders the top bar from the prototype, including no-op utility icons and the real close action.
@@ -731,6 +756,14 @@ fn rect_bounds(rect: &Rect) -> egui::Rect {
     )
 }
 
+fn local_rect(rect: Rect, viewport_origin: egui::Vec2) -> Rect {
+    Rect {
+        x: rect.x - f64::from(viewport_origin.x),
+        y: rect.y - f64::from(viewport_origin.y),
+        ..rect
+    }
+}
+
 /// Defines popup geometry ahead of rendering so the transparent overlay can enable or disable native
 /// hit-testing based on our intended layout, not a previous frame's measured egui output.
 fn popup_rect_for_lint(rect: &Rect) -> egui::Rect {
@@ -769,4 +802,77 @@ fn blend(from: egui::Color32, to: egui::Color32, to_weight: f32) -> egui::Color3
         ((f32::from(fg) * from_weight) + (f32::from(tg) * to_weight)) as u8,
         ((f32::from(fb) * from_weight) + (f32::from(tb) * to_weight)) as u8,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_hit_testing_follows_card_constrained_at_screen_bottom() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        for origin in [egui::Vec2::ZERO, egui::vec2(-800.0, -200.0)] {
+            let lint_rect = Rect::new(
+                100.0 + f64::from(origin.x),
+                570.0 + f64::from(origin.y),
+                80.0,
+                20.0,
+            );
+            let lint = ActionableLint::new(
+                lint_rect,
+                "test".into(),
+                Lint {
+                    message: "Use **have** rather than **of** here.".into(),
+                    suggestions: vec![Suggestion::ReplaceWith("could have".chars().collect())],
+                    ..Lint::default()
+                },
+                "could of".into(),
+                |_| {},
+            );
+            let mut state = RenderState::new(
+                vec![lint],
+                Box::new(|_, _| {}),
+                Box::new(|_| {}),
+                Box::new(|_| {}),
+            );
+            state.set_highlighted_lint(Some(0));
+            let context = egui::Context::default();
+            // Areas measure their contents before settling their constrained position.
+            for _ in 0..3 {
+                let _ = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| state.render(ui, origin),
+                );
+            }
+
+            let visible_popup = state.popup_rect().unwrap();
+            assert!(visible_popup.bottom() <= screen.bottom() + origin.y);
+            assert!(visible_popup.left() >= origin.x);
+            // A second monitor must neither draw a duplicate popup nor replace its hit region.
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 1000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| state.render(ui, origin + egui::vec2(800.0, 0.0)),
+            );
+            assert_eq!(state.popup_rect(), Some(visible_popup));
+            assert!(!popup_rect_for_lint(&lint_rect).contains(visible_popup.center()));
+            assert_eq!(
+                state.hit_target_at_pos(visible_popup.center()),
+                HitTarget::Popup
+            );
+            state.close_popup();
+            assert_eq!(
+                state.hit_target_at_pos(visible_popup.center()),
+                HitTarget::None
+            );
+        }
+    }
 }
